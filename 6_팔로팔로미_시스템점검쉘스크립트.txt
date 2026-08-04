@@ -1,0 +1,1522 @@
+#!/bin/bash
+
+# 자동화 시 PATH 문제 방지
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# 1. 전역 변수 초기화 (최상단에 위치해야 합니다)
+TOTAL_COUNT=0
+GOOD_COUNT=0
+BAD_COUNT=0
+MANUAL_COUNT=0
+
+# 2. 결과 출력 및 집계 함수
+result_print() {
+    local input=("$@")
+    local code="${input[0]}"
+    local check_content="${input[1]}"
+    local overall_result="${input[2]}"
+    
+    # [핵심] 결과 누적 로직 (여기서 1~67까지 카운트를 셉니다)
+    ((TOTAL_COUNT++))
+    if [[ "$overall_result" == "취약" ]]; then
+        ((BAD_COUNT++))
+    elif [[ "$overall_result" == "수동점검" ]]; then
+        ((MANUAL_COUNT++))
+    else
+        ((GOOD_COUNT++))
+    fi
+
+    # 기존 출력 로직
+    local red="\e[31m"
+    local green="\e[32m"
+    local yellow="\e[33m"
+    local reset="\e[0m"
+
+    echo -e "[${yellow}${code}${reset}] ${check_content}"
+    echo "----------------------------------------------------------"
+    
+    local result_color="$green"
+    if [[ "$overall_result" == "취약" ]]; then result_color="$red"; fi
+    echo -e ": ${result_color}${overall_result}${reset}"
+
+    local total_args=${#input[@]}
+    for ((i=3; i<total_args; i+=3)); do
+
+    local detail="${input[$i]}"
+    local result="${input[$((i+1))]}"
+    local requirement="${input[$((i+2))]}"
+
+    # U_14~U_33처럼 상세내용만 전달된 경우 처리
+    if [[ -z "$result" && -z "$requirement" ]]; then
+        echo -e "\t [+] ${detail}"
+        continue
+    fi
+
+    # [수정] 결과가 취약이면 기호를 [!]로, 아니면 [+]로 설정
+        local item_symbol="+"
+        local item_color="$green"
+        if [[ "$result" == "취약" ]]; then
+            item_symbol="!"
+            item_color="$red"
+        fi
+
+        echo -e "\t [${item_color}${item_symbol}${reset}] ${detail}: ${item_color}${result}${reset}"
+
+        if [[ "$overall_result" != "양호" && -n "$requirement" && "$requirement" != "-" ]]; then
+            echo -e "\t      [!] 조치사항: ${requirement}"
+        fi
+    done
+    echo ""
+}
+
+# [새로 추가할 도구 함수들]
+is_enabled_or_active() { systemctl is-enabled "$1" >/dev/null 2>&1 || systemctl is-active "$1" >/dev/null 2>&1; }
+is_active() { systemctl is-active "$1" >/dev/null 2>&1; }
+listen_tcp() { ss -ntl | grep -q ":$1 "; }
+listen_udp() { ss -nul | grep -q ":$1 "; }
+owner() { stat -c "%U" "$1" 2>/dev/null; }
+mode() { stat -c "%a" "$1" 2>/dev/null; }
+mode_le() { [ "$1" -le "$2" ]; }
+
+# --------------------------------------------------------------------
+# 스크립트 실행 부분
+# --------------------------------------------------------------------
+echo -e "\n시스템 점검 테스트를 시작합니다...\n"
+
+# --------------------------------------------------------------------
+# [U_01] root 계정 원격 접속 제한
+# --------------------------------------------------------------------
+U_01()
+{
+    local output_mode=$1
+    local desc="root 계정 원격접속 제한"
+    local detail_1="SSH 원격 접속 제한 여부"
+
+    # 우분투 환경 점검 로직 (PermitRootLogin 찾기)
+    local root_login=$(grep -i "^PermitRootLogin" /etc/ssh/sshd_config | awk '{print $2}')
+
+    if [[ "$root_login" == "no" ]]; then
+        total_result="양호"
+        detail_1_result="양호"
+        detail_1_order="-"
+    else
+        total_result="취약"
+        detail_1_result="취약"
+        detail_1_order="/etc/ssh/sshd_config 파일에서 PermitRootLogin no 설정 필요"
+    fi
+
+    # 출력
+    if [[ "$output_mode" == "all" ]]; then
+        result_print "U_01" "$desc" "$total_result" "$detail_1" "$detail_1_result" "$detail_1_order"
+    elif [[ "$output_mode" == "vulnerable" && "$total_result" == "취약" ]]; then
+        result_print "U_01" "$desc" "$total_result" "$detail_1" "$detail_1_result" "$detail_1_order"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_02] 비밀번호 관리정책 설정
+# --------------------------------------------------------------------
+U_02()
+{
+    local output_mode=$1
+    local desc="패스워드 복잡성 설정"
+    local total_result="양호"
+    
+    # 여러 개의 점검 항목을 한 번에 담아서 배열 선언
+    local details=()
+    local conf_file="/etc/security/pwquality.conf"
+
+    # 1. 패스워드 복잡성 모듈(pwquality) 활성화 여부 확인
+    local pam_check=$(grep "pam_pwquality.so" /etc/pam.d/common-password 2>/dev/null | grep -v "^#")
+    if [[ -z "$pam_check" ]]; then
+        total_result="취약"
+        details+=("복잡성 모듈 활성화")
+        details+=("취약")
+        details+=("/etc/pam.d/common-password 파일에 pam_pwquality.so 설정 필요")
+    else
+        details+=("복잡성 모듈 활성화")
+        details+=("양호")
+        details+=("-")
+    fi
+
+    # 2. 최소 길이 (minlen) 8자리 이상 확인
+    local minlen=$(grep -E "^\s*minlen" "$conf_file" 2>/dev/null | awk -F'=' '{print $2}' | tr -d ' ')
+    if [[ -z "$minlen" ]] || [[ "$minlen" -lt 8 ]]; then
+        total_result="취약"
+        details+=("최소 길이(minlen) 8자리 이상")
+        details+=("취약")
+        details+=("$conf_file 파일에서 minlen=8 이상 설정 필요")
+    else
+        details+=("최소 길이(minlen) 8자리 이상")
+        details+=("양호")
+        details+=("-")
+    fi
+
+    # 3. 영문 소문자/대문자/숫자/특수문자 요구 (lcredit, ucredit, dcredit, ocredit) -1 설정 확인
+    local credits=("lcredit" "ucredit" "dcredit" "ocredit")
+    for cred in "${credits[@]}"; do
+        local val=$(grep -E "^\s*$cred" "$conf_file" 2>/dev/null | awk -F'=' '{print $2}' | tr -d ' ')
+        if [[ "$val" != "-1" ]]; then
+            total_result="취약"
+            details+=("$cred (문자종류 조합)")
+            details+=("취약")
+            details+=("$conf_file 파일에서 $cred=-1 설정 필요")
+        else
+            details+=("$cred (문자종류 조합)")
+            details+=("양호")
+            details+=("-")
+        fi
+    done
+
+    # result_print 함수로 배열 전체를 던져서 한 번에 예쁘게 출력!
+    if [[ "$output_mode" == "all" ]]; then
+        result_print "U_02" "$desc" "$total_result" "${details[@]}"
+    elif [[ "$output_mode" == "vulnerable" && "$total_result" == "취약" ]]; then
+        result_print "U_02" "$desc" "$total_result" "${details[@]}"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_03] 계정 잠금 임계값 설정
+# --------------------------------------------------------------------
+U_03()
+{
+    local output_mode=$1
+    local desc="계정 잠금 임계값 설정"
+    local total_result="양호"
+    local details=()
+
+    local pam_file="/etc/pam.d/common-auth"
+    
+    # 우분투(Debian) KISA 기준: pam_tally2.so 또는 pam_faillock.so 에서 deny 값 추출
+    local deny_value=$(grep -E "pam_tally.so|pam_tally2.so|pam_faillock.so" "$pam_file" 2>/dev/null | grep -v "^#" | grep -oP 'deny=\K[0-9]+' | head -n 1)
+
+    # 1. 설정이 아예 없는 경우
+    if [[ -z "$deny_value" ]]; then
+        total_result="취약"
+        details+=("계정 잠금 정책(deny) 설정 여부")
+        details+=("취약")
+        details+=("$pam_file 파일에 pam_faillock.so 및 deny 설정 필요")
+        
+    # 2. 설정이 있고 10회 이하인 경우 (KISA 양호 기준)
+    elif [[ "$deny_value" -le 10 && "$deny_value" -gt 0 ]]; then
+        details+=("계정 잠금 임계값 10회 이하 설정")
+        details+=("양호")
+        details+=("-")
+        
+    # 3. 설정은 있는데 10회를 초과한 경우 (취약)
+    else
+        total_result="취약"
+        details+=("계정 잠금 임계값 10회 이하 설정")
+        details+=("취약")
+        details+=("현재 deny=$deny_value 로 설정됨. 10 이하로 변경 필요")
+    fi
+
+    # 출력
+    if [[ "$output_mode" == "all" ]]; then
+        result_print "U_03" "$desc" "$total_result" "${details[@]}"
+    elif [[ "$output_mode" == "vulnerable" && "$total_result" == "취약" ]]; then
+        result_print "U_03" "$desc" "$total_result" "${details[@]}"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_04] 비밀번호 파일 보호
+# --------------------------------------------------------------------
+U_04()
+{
+    local output_mode=$1
+    local desc="비밀번호 파일 보호 (쉐도우 패스워드 사용 여부)"
+    local total_result="양호"
+    local details=()
+
+    local passwd_file="/etc/passwd"
+    local shadow_file="/etc/shadow"
+
+    # 1. /etc/shadow 파일이 존재하는지 1차 확인
+    if [ ! -f "$shadow_file" ]; then
+        details+=("쉐도우 패스워드 파일(/etc/shadow) 존재 여부")
+        details+=("취약")
+        details+=("pwconv 명령어를 실행하여 쉐도우 패스워드를 적용해야 합니다.")
+        total_result="취약"
+    else
+        details+=("쉐도우 패스워드 파일(/etc/shadow) 존재 여부")
+        details+=("양호")
+        details+=("-")
+    fi
+
+    # 2. KISA 기준: /etc/passwd 파일 두 번째 필드가 'x'인지 검사
+    # 패스워드 필드($2)가 'x'도 아니고 '*'도 아닌(즉, 평문으로 노출된) 계정 찾기
+    local unshadowed_users=$(awk -F: '$2 != "x" && $2 != "*" {print $1}' "$passwd_file")
+
+    if [ -n "$unshadowed_users" ]; then
+        details+=("/etc/passwd 암호화 상태 (두 번째 필드 'x' 표시 여부)")
+        details+=("취약")
+        details+=("암호화되지 않은 계정 존재. 시스템 관리자 권한으로 pwconv 명령어 실행 필요")
+        total_result="취약"
+    else
+        details+=("/etc/passwd 암호화 상태 (두 번째 필드 'x' 표시 여부)")
+        details+=("양호")
+        details+=("-")
+    fi
+
+    # 출력
+    if [[ "$output_mode" == "all" ]]; then
+        result_print "U_04" "$desc" "$total_result" "${details[@]}"
+    elif [[ "$output_mode" == "vulnerable" && "$total_result" == "취약" ]]; then
+        result_print "U_04" "$desc" "$total_result" "${details[@]}"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_05] root 이외의 UID가 ‘0’ 금지
+# --------------------------------------------------------------------
+U_05()
+{
+    local output_mode=$1
+    local desc="root 이외의 UID가 '0' 금지"
+    local total_result="양호"
+    local details=()
+
+    # /etc/passwd 파일에서 UID(3번째 필드)가 0인데, 계정명(1번째 필드)이 'root'가 아닌 계정 추출
+    local uid_zero_users=$(awk -F: '$3 == 0 && $1 != "root" {print $1}' /etc/passwd)
+
+    if [[ -z "$uid_zero_users" ]]; then
+        details+=("UID가 0인 일반 계정 존재 여부")
+        details+=("양호")
+        details+=("-")
+    else
+        total_result="취약"
+        details+=("UID가 0인 일반 계정 존재 여부")
+        details+=("취약")
+        
+        # 발견된 취약 계정들의 이름을 가로로 정렬
+        local users_formatted=$(echo "$uid_zero_users" | tr '\n' ' ')
+        details+=("root 외에 UID가 0인 계정 존재: [ $users_formatted ]. usermod -u 명령으로 UID 변경 필요")
+    fi
+
+    # 출력
+    if [[ "$output_mode" == "all" ]]; then
+        result_print "U_05" "$desc" "$total_result" "${details[@]}"
+    elif [[ "$output_mode" == "vulnerable" && "$total_result" == "취약" ]]; then
+        result_print "U_05" "$desc" "$total_result" "${details[@]}"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_06] 사용자 계정 su 기능 제한
+# --------------------------------------------------------------------
+U_06()
+{
+    local output_mode=$1
+    local desc="사용자 계정 su 기능 제한"
+    local total_result="양호"
+    local details=()
+
+    local pam_su="/etc/pam.d/su"
+
+    # /etc/pam.d/su 파일에서 주석(#)이 해제된 pam_wheel.so 모듈 찾기
+    local wheel_check=$(grep -v "^\s*#" "$pam_su" 2>/dev/null | grep "pam_wheel.so")
+
+    if [[ -n "$wheel_check" ]]; then
+        details+=("su 명령어 사용 제한 설정 (pam_wheel.so)")
+        details+=("양호")
+        details+=("-")
+    else
+        total_result="취약"
+        details+=("su 명령어 사용 제한 설정 (pam_wheel.so)")
+        details+=("취약")
+        details+=("$pam_su 파일에서 'auth required pam_wheel.so' 주석 해제 및 wheel 그룹 설정 필요")
+    fi
+
+    # 출력할 때는 매의 눈으로 캐치하신 "U-06" 하이픈 양식 적용!
+    if [[ "$output_mode" == "all" ]]; then
+        result_print "U-06" "$desc" "$total_result" "${details[@]}"
+    elif [[ "$output_mode" == "vulnerable" && "$total_result" == "취약" ]]; then
+        result_print "U-06" "$desc" "$total_result" "${details[@]}"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_07] 불필요한 계정 제거
+# --------------------------------------------------------------------
+U_07()
+{
+    local output_mode=$1
+    local desc="불필요한 계정 제거"
+    local total_result="양호"
+    local details=()
+
+    # KISA가 가이드에서 명시한 '기본 생성되는 불필요한 계정' 리스트
+    local unnecessary_accounts=("lp" "uucp" "nuucp" "games")
+    local found_accounts=()
+
+    # /etc/passwd 파일에서 해당 계정들이 존재하는지 하나씩 검사
+    for account in "${unnecessary_accounts[@]}"; do
+        if grep -q "^${account}:" /etc/passwd; then
+            found_accounts+=("$account")
+        fi
+    done
+
+    # 발견된 계정이 0개라면 양호
+    if [ ${#found_accounts[@]} -eq 0 ]; then
+        details+=("기본 불필요 계정(lp, uucp 등) 존재 여부")
+        details+=("양호")
+        details+=("-")
+    else
+        # 하나라도 발견되면 취약 처리
+        total_result="취약"
+        details+=("기본 불필요 계정(lp, uucp 등) 존재 여부")
+        details+=("취약")
+        
+        # 발견된 계정들을 보기 좋게 쉼표(,)로 연결해서 출력
+        local formatted_accounts=$(IFS=, ; echo "${found_accounts[*]}")
+        details+=("불필요한 계정 발견: [ $formatted_accounts ]. userdel 명령어로 제거 권고")
+    fi
+
+    # 출력
+    if [[ "$output_mode" == "all" ]]; then
+        result_print "U-07" "$desc" "$total_result" "${details[@]}"
+    elif [[ "$output_mode" == "vulnerable" && "$total_result" == "취약" ]]; then
+        result_print "U-07" "$desc" "$total_result" "${details[@]}"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_08] 관리자 그룹에 최소한의 계정 포함
+# --------------------------------------------------------------------
+U_08()
+{
+    local output_mode=$1
+    local desc="관리자 그룹에 최소한의 계정 포함"
+    local total_result="양호"
+    local details=()
+
+    # /etc/group 파일에서 root 그룹에 속한 추가 사용자 목록(4번째 필드) 추출
+    local root_members=$(awk -F: '$1 == "root" {print $4}' /etc/group)
+
+    # 목록이 아예 비어있거나, 'root' 본인만 적혀있다면 안전한 상태(양호)
+    if [[ -z "$root_members" || "$root_members" == "root" ]]; then
+        details+=("root 그룹 내 불필요한 추가 계정 존재 여부")
+        details+=("양호")
+        details+=("-")
+    else
+        # 엉뚱한 사용자가 들어있다면 취약 처리
+        total_result="취약"
+        details+=("root 그룹 내 불필요한 추가 계정 존재 여부")
+        details+=("취약")
+        details+=("root 그룹에 불필요한 계정 [ $root_members ] 존재. 'gpasswd -d <계정명> root' 명령으로 제거 필요")
+    fi
+
+    # 출력
+    if [[ "$output_mode" == "all" ]]; then
+        result_print "U-08" "$desc" "$total_result" "${details[@]}"
+    elif [[ "$output_mode" == "vulnerable" && "$total_result" == "취약" ]]; then
+        result_print "U-08" "$desc" "$total_result" "${details[@]}"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_09] 계정이 존재하지 않는 GID 금지
+# --------------------------------------------------------------------
+U_09()
+{
+    local output_mode=$1
+    local desc="계정이 존재하지 않는 GID 금지 (불필요한 그룹 제거)"
+    local total_result="양호"
+    local details=()
+
+    # 1. /etc/passwd 에서 현재 사용 중인 '기본 그룹(Primary GID)' 목록을 쫙 뽑아옵니다.
+    local used_gids=$(awk -F: '{print $4}' /etc/passwd | sort -u)
+    
+    local empty_groups=()
+
+    # 2. /etc/group 에서 GID 1000 이상(일반 그룹)인 녀석들 중, 
+    # 멤버가 텅 비어있고, /etc/passwd에서도 안 쓰는 진짜 껍데기 그룹을 찾습니다.
+    while IFS=: read -r group_name password gid members; do
+        # GID 1000 이상이면서 우분투 기본 그룹(nobody, nogroup)은 예외 처리
+        if [[ "$gid" -ge 1000 && "$group_name" != "nogroup" && "$group_name" != "nobody" ]]; then
+            # 4번째 필드(멤버)가 비어있는지 1차 확인
+            if [[ -z "$members" ]]; then
+                # /etc/passwd의 기본 GID로도 안 쓰이는지 2차 확인
+                if ! echo "$used_gids" | grep -qx "$gid"; then
+                    empty_groups+=("$group_name")
+                fi
+            fi
+        fi
+    done < /etc/group
+
+    # 비어있는 그룹이 0개라면 양호!
+    if [ ${#empty_groups[@]} -eq 0 ]; then
+        details+=("계정이 없는 불필요한 일반 그룹 존재 여부")
+        details+=("양호")
+        details+=("-")
+    else
+        # 하나라도 발견되면 취약!
+        total_result="취약"
+        details+=("계정이 없는 불필요한 일반 그룹 존재 여부")
+        details+=("취약")
+        
+        local formatted_groups=$(IFS=, ; echo "${empty_groups[*]}")
+        details+=("불필요한 그룹 발견: [ $formatted_groups ]. 확인 후 groupdel 명령으로 제거 권고")
+    fi
+
+    # 출력
+    if [[ "$output_mode" == "all" ]]; then
+        result_print "U-09" "$desc" "$total_result" "${details[@]}"
+    elif [[ "$output_mode" == "vulnerable" && "$total_result" == "취약" ]]; then
+        result_print "U-09" "$desc" "$total_result" "${details[@]}"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_10] 동일한 UID 금지
+# --------------------------------------------------------------------
+U_10()
+{
+    local output_mode=$1
+    local desc="동일한 UID 금지"
+    local total_result="양호"
+    local details=()
+
+    # /etc/passwd 파일에서 3번째 필드(UID)만 뽑아서 정렬 후, 중복된 값만(-d) 추출
+    local duplicate_uids=$(awk -F: '{print $3}' /etc/passwd | sort | uniq -d)
+
+    if [[ -z "$duplicate_uids" ]]; then
+        details+=("중복된 UID 존재 여부")
+        details+=("양호")
+        details+=("-")
+    else
+        total_result="취약"
+        details+=("중복된 UID 존재 여부")
+        details+=("취약")
+        
+        # 중복된 UID들을 가로로 예쁘게 정렬
+        local uids_formatted=$(echo "$duplicate_uids" | tr '\n' ' ' | sed 's/ $//')
+        details+=("중복된 UID 발견: [ $uids_formatted ]. usermod -u 명령으로 고유한 UID 할당 필요")
+    fi
+
+    # 출력
+    if [[ "$output_mode" == "all" ]]; then
+        result_print "U-10" "$desc" "$total_result" "${details[@]}"
+    elif [[ "$output_mode" == "vulnerable" && "$total_result" == "취약" ]]; then
+        result_print "U-10" "$desc" "$total_result" "${details[@]}"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_11] 사용자 shell 점검
+# --------------------------------------------------------------------
+U_11()
+{
+    local output_mode=$1
+    local desc="사용자 shell 점검 (로그인 불필요 계정의 쉘 제한)"
+    local total_result="양호"
+    local details=()
+
+    # KISA 가이드에 명시된 점검 대상 계정 리스트
+    local target_accounts="daemon|bin|sys|adm|listen|nobody|nobody4|noaccess|diag|operator|games|gopher"
+    local vulnerable_accounts=()
+
+    # /etc/passwd 에서 해당 계정들을 찾아 쉘(7번째 필드)이 가짜 쉘인지 검사
+    while IFS=: read -r user pass uid gid info home shell; do
+        if [[ "$shell" != "/bin/false" && "$shell" != "/sbin/nologin" && "$shell" != "/usr/sbin/nologin" ]]; then
+            vulnerable_accounts+=("$user")
+        fi
+    done < <(grep -E "^($target_accounts):" /etc/passwd)
+
+    if [ ${#vulnerable_accounts[@]} -eq 0 ]; then
+        details+=("로그인이 불필요한 계정에 /sbin/nologin 쉘 부여 여부")
+        details+=("양호")
+        details+=("-")
+    else
+        total_result="취약"
+        details+=("로그인이 불필요한 계정에 /sbin/nologin 쉘 부여 여부")
+        details+=("취약")
+        
+        local formatted_accounts=$(IFS=, ; echo "${vulnerable_accounts[*]}")
+        details+=("취약 계정 발견: [ $formatted_accounts ]. usermod -s /sbin/nologin <계정명> 명령으로 수정 필요")
+    fi
+
+    # 출력
+    if [[ "$output_mode" == "all" ]]; then
+        result_print "U-11" "$desc" "$total_result" "${details[@]}"
+    elif [[ "$output_mode" == "vulnerable" && "$total_result" == "취약" ]]; then
+        result_print "U-11" "$desc" "$total_result" "${details[@]}"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_12] 세션 종료 시간 설정
+# --------------------------------------------------------------------
+U_12()
+{
+    local output_mode=$1
+    local desc="세션 종료 시간 설정 (Session Timeout)"
+    local total_result="양호"
+    local details=()
+
+    # /etc/profile 파일에서 TMOUT 설정 값을 찾아 숫자만 추출
+    local tmout_val=$(grep -iE "^export TMOUT=|^TMOUT=" /etc/profile | cut -d= -f2 | grep -oE "[0-9]+")
+
+    # 1. 아예 설정이 없는 경우
+    if [[ -z "$tmout_val" ]]; then
+        total_result="취약"
+        details+=("Session Timeout(TMOUT) 설정 여부")
+        details+=("취약")
+        details+=("/etc/profile 파일에 TMOUT=600 및 export TMOUT 설정 필요")
+        
+    # 2. 설정은 있는데 600초(10분)보다 길게 설정된 경우
+    elif [[ "$tmout_val" -gt 600 ]]; then
+        total_result="취약"
+        details+=("Session Timeout 600초(10분) 이하 설정 여부")
+        details+=("취약")
+        details+=("현재 TMOUT=$tmout_val 초로 설정됨. 600 이하로 수정 필요")
+        
+    # 3. 600초 이하로 잘 설정된 경우 (양호)
+    else
+        details+=("Session Timeout(TMOUT) 600초 이하 설정 여부")
+        details+=("양호")
+        details+=("-")
+    fi
+
+    # 출력
+    if [[ "$output_mode" == "all" ]]; then
+        result_print "U-12" "$desc" "$total_result" "${details[@]}"
+    elif [[ "$output_mode" == "vulnerable" && "$total_result" == "취약" ]]; then
+        result_print "U-12" "$desc" "$total_result" "${details[@]}"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_13] 안전한 비밀번호 암호화 알고리즘 사용
+# --------------------------------------------------------------------
+U_13()
+{
+    local output_mode=$1
+    local desc="안전한 비밀번호 암호화 알고리즘 사용"
+    local total_result="양호"
+    local details=()
+
+    # /etc/login.defs 파일에서 ENCRYPT_METHOD 설정값 추출
+    local encrypt_method=$(grep -iE "^\s*ENCRYPT_METHOD" /etc/login.defs 2>/dev/null | awk '{print $2}')
+
+    # 1. 설정이 아예 없는 경우
+    if [[ -z "$encrypt_method" ]]; then
+        total_result="취약"
+        details+=("비밀번호 암호화 알고리즘 설정 여부")
+        details+=("취약")
+        details+=("/etc/login.defs 파일에 ENCRYPT_METHOD SHA512 설정 필요")
+        
+    # 2. SHA512, SHA256 또는 우분투 최신 알고리즘인 YESCRYPT를 사용하는 경우 (양호)
+    elif [[ "$encrypt_method" == "SHA512" || "$encrypt_method" == "SHA256" || "${encrypt_method^^}" == "YESCRYPT" ]]; then
+        details+=("비밀번호 암호화 알고리즘 ($encrypt_method)")
+        details+=("양호")
+        details+=("-")
+        
+    # 3. MD5나 DES 같은 취약한 옛날 알고리즘을 사용하는 경우 (취약)
+    else
+        total_result="취약"
+        details+=("비밀번호 암호화 알고리즘 ($encrypt_method)")
+        details+=("취약")
+        details+=("취약한 알고리즘 사용 중. /etc/login.defs 파일에서 ENCRYPT_METHOD SHA512 로 변경 필요")
+    fi
+
+    # 출력
+    if [[ "$output_mode" == "all" ]]; then
+        result_print "U-13" "$desc" "$total_result" "${details[@]}"
+    elif [[ "$output_mode" == "vulnerable" && "$total_result" == "취약" ]]; then
+        result_print "U-13" "$desc" "$total_result" "${details[@]}"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_14] root 홈, 패스 디렉터리 권한 및 패스 설정
+# --------------------------------------------------------------------
+U_14() {
+    local ROOT_PATH=$(sudo bash -c 'echo $PATH')
+    if echo "$ROOT_PATH" | grep -qE '(^\.|:\.:|:\.)'; then
+        result_print "U-14" "root 홈, PATH 디렉터리 권한 및 PATH 설정" "취약" "PATH에 '.' 포함됨"
+    else
+        result_print "U-14" "root 홈, PATH 디렉터리 권한 및 PATH 설정" "양호" "PATH에 '.' 없음"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_15] 파일 및 디렉터리 소유자 설정
+# --------------------------------------------------------------------
+U_15() {
+    local ORPHAN_COUNT=$(sudo find / -xdev \( -nouser -o -nogroup \) 2>/dev/null | wc -l)
+    if [ "$ORPHAN_COUNT" -eq 0 ]; then
+        result_print "U-15" "파일 및 디렉터리 소유자 설정" "양호" "소유자 없는 파일 없음"
+    else
+        result_print "U-15" "파일 및 디렉터리 소유자 설정" "취약" "소유자 없는 파일 수 : $ORPHAN_COUNT"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_16] /etc/passwd 파일 소유자 및 권한 설정
+# --------------------------------------------------------------------
+U_16() {
+    local OWNER=$(stat -c %U /etc/passwd)
+    local PERM=$(stat -c %a /etc/passwd)
+    if [ "$OWNER" = "root" ] && [ "$PERM" -le 644 ]; then
+        result_print "U-16" "/etc/passwd 파일 소유자 및 권한 설정" "양호" "소유자 : $OWNER" "[+] 권한 : $PERM"
+    else
+        result_print "U-16" "/etc/passwd 파일 소유자 및 권한 설정" "취약" "소유자 : $OWNER" "[+] 권한 : $PERM"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_17] 시스템 시작 스크립트 권한 설정 
+# --------------------------------------------------------------------
+U_17() {
+    local desc="시스템 시작 스크립트 권한 설정"
+    if [ ! -e /etc/rc.local ]; then # -f 대신 -e(존재 여부) 사용
+        result_print "U-17" "$desc" "양호" "/etc/rc.local 파일 없음" "양호" "-"
+    else
+        # [중요] OWNER와 PERM 모두 -L 옵션을 사용하여 원본을 참조하도록 수정
+        local OWNER=$(stat -L -c %U /etc/rc.local)
+        local PERM=$(stat -L -c %a /etc/rc.local)
+        
+        local owner_res="양호"; local owner_req="-"
+        local perm_res="양호"; local perm_req="-"
+
+        if [ "$OWNER" != "root" ]; then
+            owner_res="취약"; owner_req="chown root /etc/rc.d/rc.local"
+        fi
+        
+        # 권한 비교 (PERM이 755보다 큰지 숫자 비교)
+        if [ "$PERM" -gt 755 ]; then
+            perm_res="취약"; perm_req="chmod 755 /etc/rc.d/rc.local"
+        fi
+
+        local final_res="양호"
+        if [ "$owner_res" == "취약" ] || [ "$perm_res" == "취약" ]; then final_res="취약"; fi
+
+        result_print "U-17" "$desc" "$final_res" \
+        "소유자: $OWNER" "$owner_res" "$owner_req" \
+        "권한: $PERM" "$perm_res" "$perm_req"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_18] /etc/shadow 파일 소유자 및 권한 설정
+# --------------------------------------------------------------------
+U_18() {
+    local OWNER=$(sudo stat -c %U /etc/shadow)
+    local PERM=$(sudo stat -c %a /etc/shadow)
+    if [ "$OWNER" = "root" ] && [ "$PERM" -le 640 ]; then
+        result_print "U-18" "/etc/shadow 파일 소유자 및 권한 설정" "양호" "소유자 : $OWNER" "[+] 권한 : $PERM"
+    else
+        result_print "U-18" "/etc/shadow 파일 소유자 및 권한 설정" "취약" "소유자 : $OWNER" "[+] 권한 : $PERM"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_19] /etc/hosts 파일 소유자 및 권한 설정
+# --------------------------------------------------------------------
+U_19() {
+    local OWNER=$(stat -c %U /etc/hosts)
+    local PERM=$(stat -c %a /etc/hosts)
+    if [ "$OWNER" = "root" ] && [ "$PERM" -le 644 ]; then
+        result_print "U-19" "/etc/hosts 파일 소유자 및 권한 설정" "양호" "소유자 : $OWNER" "[+] 권한 : $PERM"
+    else
+        result_print "U-19" "/etc/hosts 파일 소유자 및 권한 설정" "취약" "소유자 : $OWNER" "[+] 권한 : $PERM"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_20] /etc/(x)inetd.conf 파일 소유자 및 권한 설정
+# --------------------------------------------------------------------
+U_20() {
+    if [ ! -f /etc/inetd.conf ] && [ ! -f /etc/xinetd.conf ]; then
+        result_print "U-20" "inetd/xinetd 설정 파일 권한 점검" "양호" "inetd/xinetd 미사용"
+    else
+        result_print "U-20" "inetd/xinetd 설정 파일 권한 점검" "점검필요" "설정 파일 존재 확인 필요"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_21] /etc/(r)syslog.conf 파일 소유자 및 권한 설정
+# --------------------------------------------------------------------
+U_21() {
+    local OWNER=$(stat -c %U /etc/rsyslog.conf)
+    local PERM=$(stat -c %a /etc/rsyslog.conf)
+    if [ "$OWNER" = "root" ] && [ "$PERM" -le 644 ]; then
+        result_print "U-21" "rsyslog.conf 파일 소유자 및 권한 설정" "양호" "소유자 : $OWNER" "[+] 권한 : $PERM"
+    else
+        result_print "U-21" "rsyslog.conf 파일 소유자 및 권한 설정" "취약" "소유자 : $OWNER" "[+] 권한 : $PERM"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_22] /etc/services 파일 소유자 및 권한 설정
+# --------------------------------------------------------------------
+U_22() {
+    local OWNER=$(stat -c %U /etc/services)
+    local PERM=$(stat -c %a /etc/services)
+    if [ "$OWNER" = "root" ] && [ "$PERM" -le 644 ]; then
+        result_print "U-22" "/etc/services 파일 소유자 및 권한 설정" "양호" "소유자 : $OWNER" "[+] 권한 : $PERM"
+    else
+        result_print "U-22" "/etc/services 파일 소유자 및 권한 설정" "취약" "소유자 : $OWNER" "[+] 권한 : $PERM"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_23] SUID, SGID, Sticky bit 설정 파일 점검
+# --------------------------------------------------------------------
+U_23() {
+    local SUID_COUNT=$(sudo find /usr/bin /usr/sbin -perm /6000 -type f 2>/dev/null | wc -l)
+    if [ "$SUID_COUNT" -gt 0 ]; then
+        result_print "U-23" "SUID/SGID 설정 파일 점검" "양호" "SUID/SGID 파일 수 : $SUID_COUNT"
+    else
+        result_print "U-23" "SUID/SGID 설정 파일 점검" "취약" "SUID/SGID 파일 없음"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_24] 사용자, 시스템 환경변수 파일 소유자 및 권한 설정
+# --------------------------------------------------------------------
+U_24() {
+    local BAD_COUNT=0
+    for FILE in ~/.profile ~/.bashrc ~/.bash_profile; do
+        if [ -f "$FILE" ]; then
+            PERM=$(stat -c %a "$FILE")
+            if [ "$PERM" -gt 644 ]; then BAD_COUNT=$((BAD_COUNT+1)); fi
+        fi
+    done
+    if [ "$BAD_COUNT" -eq 0 ]; then
+        result_print "U-24" "사용자 환경변수 파일 권한" "양호" "환경변수 파일 권한 정상"
+    else
+        result_print "U-24" "사용자 환경변수 파일 권한" "취약" "권한 과다 파일 수 : $BAD_COUNT"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_25] world writable 파일 점검
+# --------------------------------------------------------------------
+U_25() {
+    local WW_COUNT=$(find /home -type f -perm -0002 2>/dev/null | wc -l)
+    if [ "$WW_COUNT" -eq 0 ]; then
+        result_print "U-25" "World Writable 파일 점검" "양호" "World Writable 파일 없음"
+    else
+        result_print "U-25" "World Writable 파일 점검" "취약" "World Writable 파일 수 : $WW_COUNT"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_26] /dev에 존재하지 않는 device 파일 점검
+# --------------------------------------------------------------------
+U_26() {
+    local desc="/dev 내 존재하지 않는 device 파일 점검"
+    
+    # 1. /dev 내의 일반 파일 경로들을 찾아서 파일 개수만 카운트
+    local DEV_COUNT=$(find /dev -type f 2>/dev/null | wc -l)
+
+    # 2. 결과 판정
+    if [ "$DEV_COUNT" -eq 0 ]; then
+        result_print "U-26" "$desc" "양호" "일반 파일 없음" "양호" "-"
+    else
+        # [디버깅용] 파일이 무엇인지 보고 싶다면 아래 주석 해제
+        # echo "$DEV_FILES"
+        result_print "U-26" "$desc" "취약" \
+        "일반 파일 수: $DEV_COUNT 개 발견" "취약" "불필요한 일반 파일 삭제 (rm [파일명])"
+    fi
+}
+# --------------------------------------------------------------------
+# [U_27] $HOME/.rhosts, hosts.equiv 사용 금지
+# --------------------------------------------------------------------
+U_27() {
+    if [ -f /etc/hosts.equiv ] || [ -f ~/.rhosts ]; then
+        result_print "U-27" ".rhosts, hosts.equiv 사용 금지" "취약" "rhosts 관련 파일 존재"
+    else
+        result_print "U-27" ".rhosts, hosts.equiv 사용 금지" "양호" "rhosts 관련 파일 없음"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_28] 접속 IP 및 포트 제한
+# --------------------------------------------------------------------
+U_28() {
+    local desc="접속 IP 및 포트 제한"
+    # 파일이 존재하는지, 그리고 내용이 비어있지 않은지 확인
+    if [ -f /etc/hosts.allow ] && [ -s /etc/hosts.allow ] || [ -f /etc/hosts.deny ] && [ -s /etc/hosts.deny ]; then
+        # 존재하고 내용이 있다면 양호
+        result_print "U-28" "$desc" "양호" "접근제어 파일 존재 및 설정 확인됨" "양호" "-"
+    else
+        # 파일이 없거나 내용이 비어있으면 취약
+        result_print "U-28" "$desc" "취약" \
+        "접근제어 파일(/etc/hosts.allow 또는 /etc/hosts.deny) 부재 또는 설정 내용 없음" \
+        "취약" "접근제어 파일 생성 및 허용/차단 정책 설정"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_29] hosts.lpd 파일 소유자 및 권한 설정
+# --------------------------------------------------------------------
+U_29() {
+    if [ ! -f /etc/hosts.lpd ]; then
+        result_print "U-29" "hosts.lpd 파일 소유자 및 권한 설정" "양호" "hosts.lpd 파일 없음"
+    else
+        local OWNER=$(stat -c %U /etc/hosts.lpd)
+        local PERM=$(stat -c %a /etc/hosts.lpd)
+        if [ "$OWNER" = "root" ] && [ "$PERM" -le 600 ]; then
+            result_print "U-29" "hosts.lpd 파일 소유자 및 권한 설정" "양호" "소유자 : $OWNER" "[+] 권한 : $PERM"
+        else
+            result_print "U-29" "hosts.lpd 파일 소유자 및 권한 설정" "취약" "소유자 : $OWNER" "[+] 권한 : $PERM"
+        fi
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_30] UMASK 설정 관리
+# --------------------------------------------------------------------
+U_30() {
+    local UMASK_VALUE=$(grep -E "^UMASK" /etc/login.defs | awk '{print $2}')
+    if [ "$UMASK_VALUE" = "022" ]; then
+        result_print "U-30" "UMASK 설정 관리" "양호" "UMASK 설정값 : $UMASK_VALUE"
+    else
+        result_print "U-30" "UMASK 설정 관리" "취약" "UMASK 설정값 : $UMASK_VALUE"
+    fi
+}
+
+# -------------------------------------------------------------------
+# [U_31] 홈 디렉토리 소유자 및 권한 설정
+# --------------------------------------------------------------------
+U_31() {
+    local desc="홈 디렉터리 소유자 및 권한 설정"
+    local BAD_HOME=0
+    
+ # 디렉토리가 없으면 '점검 대상 아님'으로 표시하게 변경
+while IFS=: read -r user pass uid gid comment home shell; do
+    if [ "$uid" -ge 1000 ]; then
+        # nobody 계정 예외 처리
+        if [ "$user" == "nobody" ]; then
+            continue
+        fi
+
+        if [ ! -d "$home" ]; then
+            continue
+        elif [ "$(stat -c %U "$home")" != "$user" ]; then
+            BAD_HOME=$((BAD_HOME+1))
+        fi
+    fi
+done < /etc/passwd
+
+    if [ "$BAD_HOME" -eq 0 ]; then
+        result_print "U-31" "$desc" "양호" "모든 사용자 홈 디렉토리 소유자 정상" "양호" "-"
+    else
+        result_print "U-31" "$desc" "취약" \
+        "소유자 불일치 계정 수 : $BAD_HOME 개" "취약" "chown [계정명] [홈디렉토리] 명령어로 소유자 변경 필요"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_32] 홈 디렉토리로 지정한 디렉토리의 존재 관리
+# --------------------------------------------------------------------
+U_32() {
+    local MISSING_HOME=0
+    while IFS=: read -r user pass uid gid comment home shell; do
+        if [ "$uid" -ge 1000 ] && [ "$user" != "nobody" ]; then
+            if [ ! -d "$home" ]; then MISSING_HOME=$((MISSING_HOME+1)); fi
+        fi
+    done < /etc/passwd
+    if [ "$MISSING_HOME" -eq 0 ]; then
+        result_print "U-32" "홈 디렉터리 존재 여부 점검" "양호" "모든 홈 디렉터리 존재"
+    else
+        result_print "U-32" "홈 디렉터리 존재 여부 점검" "취약" "없는 홈 디렉터리 수 : $MISSING_HOME"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_33] 숨겨진 파일 및 디렉토리 검색 및 제거
+# --------------------------------------------------------------------
+U_33() {
+    local HIDDEN_COUNT=$(find /tmp /var/tmp -name ".*" ! -name ".X11-unix" ! -name ".XIM-unix" ! -name ".ICE-unix" ! -name ".font-unix" ! -name ".X0-lock" ! -name ".X1-lock" ! -name ".Test-unix" 2>/dev/null | wc -l)
+    if [ "$HIDDEN_COUNT" -eq 0 ]; then
+        result_print "U-33" "숨겨진 파일 및 디렉터리 검색" "양호" "의심스러운 숨김 파일 없음"
+    else
+        result_print "U-33" "숨겨진 파일 및 디렉터리 검색" "점검필요" "숨김 파일 수 : $HIDDEN_COUNT"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_34] Finger 서비스 비활성화
+# --------------------------------------------------------------------
+U_34() {
+    local output_mode=$1; local desc="Finger 서비스 비활성화"; local total_result="양호"; local details=()
+    if is_enabled_or_active finger || is_enabled_or_active fingerd || listen_tcp 79; then
+        total_result="취약"; details+=("Finger 서비스 상태"); details+=("취약"); details+=("79번 포트 활성 확인, 서비스 중지 필요")
+    else
+        details+=("Finger 서비스 상태"); details+=("양호"); details+=("-")
+    fi
+    [[ "$output_mode" == "all" || ("$output_mode" == "vulnerable" && "$total_result" == "취약") ]] && result_print "U-34" "$desc" "$total_result" "${details[@]}"
+}
+
+# --------------------------------------------------------------------
+# [U_35] 공유 서비스에 대한 익명 접근 제한 설정
+# --------------------------------------------------------------------
+U_35() {
+    local output_mode=$1; local desc="공유 서비스 익명 접근 제한"; local total_result="양호"; local details=()
+    local bad="$(grep -RsiE '^[[:space:]]*(anonymous_enable[[:space:]]*=[[:space:]]*YES|guest ok[[:space:]]*=[[:space:]]*yes|public[[:space:]]*=[[:space:]]*yes)' /etc/vsftpd.conf /etc/samba/smb.conf 2>/dev/null | head -n 1)"
+    grep -Ev '^[[:space:]]*#|^[[:space:]]*$' /etc/exports 2>/dev/null | grep -q '\*' && bad="/etc/exports wildcard export"
+    if [ -n "$bad" ]; then
+        total_result="취약"; details+=("익명 접근 설정"); details+=("취약"); details+=("설정 확인: $bad")
+    else
+        details+=("익명 접근 설정"); details+=("양호"); details+=("-")
+    fi
+    [[ "$output_mode" == "all" || ("$output_mode" == "vulnerable" && "$total_result" == "취약") ]] && result_print "U-35" "$desc" "$total_result" "${details[@]}"
+}
+
+# --------------------------------------------------------------------
+# [U_36] r 계열 서비스 비활성화
+# --------------------------------------------------------------------
+U_36() {
+    local output_mode=$1; local desc="r 계열 서비스 비활성화"; local total_result="양호"; local details=()
+    local bad="$(grep -RsiE '^[[:space:]]*(shell|login|exec|rsh|rlogin|rexec)' /etc/inetd.conf /etc/xinetd.d 2>/dev/null | grep -vi 'disable[[:space:]]*=[[:space:]]*yes' | head -n 1)"
+    if listen_tcp 512 || listen_tcp 513 || listen_tcp 514 || [ -n "$bad" ]; then
+        total_result="취약"; details+=("r 계열 서비스"); details+=("취약"); details+=("rsh, rlogin, rexec 비활성 필요")
+    else
+        details+=("r 계열 서비스"); details+=("양호"); details+=("-")
+    fi
+    [[ "$output_mode" == "all" || ("$output_mode" == "vulnerable" && "$total_result" == "취약") ]] && result_print "U-36" "$desc" "$total_result" "${details[@]}"
+}
+
+# --------------------------------------------------------------------
+# [U-37] crontab 설정파일 권한 설정 미흡
+# --------------------------------------------------------------------
+U_37() {
+    local output_mode=$1; local desc="crontab 파일 권한 점검"; local total_result="양호"; local details=()
+    local bad="$(find /etc/crontab /etc/cron.d /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly -type f \( ! -user root -o -perm /022 \) 2>/dev/null | head -n 1)"
+    if [ -n "$bad" ]; then
+        total_result="취약"; details+=("cron 권한 상태"); details+=("취약"); details+=("파일 소유자 root 및 644 이하 권한 필요: $bad")
+    else
+        details+=("cron 권한 상태"); details+=("양호"); details+=("-")
+    fi
+    [[ "$output_mode" == "all" || ("$output_mode" == "vulnerable" && "$total_result" == "취약") ]] && result_print "U-37" "$desc" "$total_result" "${details[@]}"
+}
+
+# --------------------------------------------------------------------
+# [U_38] DoS 공격에 취약한 서비스 비활성화
+# --------------------------------------------------------------------
+U_38() {
+    local output_mode=$1; local desc="DoS 취약 서비스 비활성화"; local total_result="양호"; local details=()
+    local bad="$(grep -RsiE '^[[:space:]]*(echo|discard|daytime|chargen)' /etc/inetd.conf /etc/xinetd.d 2>/dev/null | grep -vi 'disable[[:space:]]*=[[:space:]]*yes' | head -n 1)"
+    if [ -n "$bad" ]; then
+        total_result="취약"; details+=("DoS 취약 서비스"); details+=("취약"); details+=("설정 확인: $bad")
+    else
+        details+=("DoS 취약 서비스"); details+=("양호"); details+=("-")
+    fi
+    [[ "$output_mode" == "all" || ("$output_mode" == "vulnerable" && "$total_result" == "취약") ]] && result_print "U-38" "$desc" "$total_result" "${details[@]}"
+}
+
+# --------------------------------------------------------------------
+# [U_39] 불필요한 NFS 서비스 비활성화
+# --------------------------------------------------------------------
+U_39() {
+    local output_mode=$1; local desc="NFS 서비스 비활성화"; local total_result="양호"; local details=()
+    if is_active nfs-server || is_active nfs-kernel-server; then
+        total_result="취약"; details+=("NFS 서비스"); details+=("취약"); details+=("NFS 서비스 중지 필요")
+    else
+        details+=("NFS 서비스"); details+=("양호"); details+=("-")
+    fi
+    [[ "$output_mode" == "all" || ("$output_mode" == "vulnerable" && "$total_result" == "취약") ]] && result_print "U-39" "$desc" "$total_result" "${details[@]}"
+}
+
+# --------------------------------------------------------------------
+# [U_40] NFS 접근 통제
+# --------------------------------------------------------------------
+U_40() {
+    local output_mode=$1; local desc="NFS 접근 통제"; local total_result="양호"; local details=()
+    if ! is_active nfs-server && ! is_active nfs-kernel-server; then
+        details+=("NFS 상태"); details+=("양호"); details+=("-")
+    elif grep -Ev '^[[:space:]]*#|^[[:space:]]*$' /etc/exports 2>/dev/null | grep -Eq '(\*|no_root_squash)'; then
+        total_result="취약"; details+=("NFS 접근 통제"); details+=("취약"); details+=("wildcard 또는 no_root_squash 발견")
+    else
+        details+=("NFS 접근 통제"); details+=("양호"); details+=("-")
+    fi
+    [[ "$output_mode" == "all" || ("$output_mode" == "vulnerable" && "$total_result" == "취약") ]] && result_print "U-40" "$desc" "$total_result" "${details[@]}"
+}
+
+# --------------------------------------------------------------------
+# [U_41] 불필요한 automountd 제거
+# --------------------------------------------------------------------
+U_41() {
+    local output_mode=$1; local desc="automountd 제거"; local total_result="양호"; local details=()
+    if is_active autofs || pgrep -x automount >/dev/null 2>&1; then
+        total_result="취약"; details+=("autofs 상태"); details+=("취약"); details+=("불필요 서비스 제거 필요")
+    else
+        details+=("autofs 상태"); details+=("양호"); details+=("-")
+    fi
+    [[ "$output_mode" == "all" || ("$output_mode" == "vulnerable" && "$total_result" == "취약") ]] && result_print "U-41" "$desc" "$total_result" "${details[@]}"
+}
+
+# --------------------------------------------------------------------
+# [U_42] 불필요한 RPC 서비스 비활성화
+# --------------------------------------------------------------------
+U_42() {
+    local output_mode=$1; local desc="불필요 RPC 서비스 비활성화"; local total_result="양호"; local details=()
+    local active=""; for svc in rpcbind rpc-statd nfs-server nfs-kernel-server ypserv ypbind ypxfrd; do is_active "$svc" && active="$active $svc"; done
+    if [ -n "$active" ]; then
+        total_result="취약"; details+=("RPC 서비스 상태"); details+=("취약"); details+=("활성 서비스: $active")
+    else
+        details+=("RPC 서비스 상태"); details+=("양호"); details+=("-")
+    fi
+    [[ "$output_mode" == "all" || ("$output_mode" == "vulnerable" && "$total_result" == "취약") ]] && result_print "U-42" "$desc" "$total_result" "${details[@]}"
+}
+
+# --------------------------------------------------------------------
+# [U_43] NIS, NIS+ 점검
+# --------------------------------------------------------------------
+U_43() {
+    local output_mode=$1; local desc="NIS, NIS+ 점검"; local total_result="양호"; local details=()
+    local active=""; for svc in ypserv ypbind ypxfrd rpc-yppasswdd rpc-ypupdated; do is_active "$svc" && active="$active $svc"; done
+    if [ -n "$active" ]; then
+        total_result="취약"; details+=("NIS 상태"); details+=("취약"); details+=("활성 서비스: $active")
+    else
+        details+=("NIS 상태"); details+=("양호"); details+=("-")
+    fi
+    [[ "$output_mode" == "all" || ("$output_mode" == "vulnerable" && "$total_result" == "취약") ]] && result_print "U-43" "$desc" "$total_result" "${details[@]}"
+}
+
+# --------------------------------------------------------------------
+# [U_44] tftp, talk 서비스 비활성화
+# --------------------------------------------------------------------
+U_44() {
+    local output_mode=$1; local desc="tftp, talk 서비스 비활성화"; local total_result="양호"; local details=()
+    local active=""; for svc in tftp tftpd-hpa tftp.socket talk ntalk; do is_enabled_or_active "$svc" && active="$active $svc"; done
+    if [ -n "$active" ]; then
+        total_result="취약"; details+=("tftp/talk 상태"); details+=("취약"); details+=("활성 서비스: $active")
+    else
+        details+=("tftp/talk 상태"); details+=("양호"); details+=("-")
+    fi
+    [[ "$output_mode" == "all" || ("$output_mode" == "vulnerable" && "$total_result" == "취약") ]] && result_print "U-44" "$desc" "$total_result" "${details[@]}"
+}
+
+# --------------------------------------------------------------------
+# [U_45] 메일 서비스 버전 점검
+# --------------------------------------------------------------------
+U_45() {
+    local output_mode=$1; local desc="메일 서비스 버전 점검"; local total_result="양호"; local details=()
+    local active=""; for svc in postfix sendmail exim4 dovecot; do is_active "$svc" && active="$active $svc"; done
+    if apt list --upgradable 2>/dev/null | grep -Eiq '^(postfix|sendmail|exim4|dovecot)'; then
+        total_result="취약"; details+=("메일 서비스 버전"); details+=("취약"); details+=("업데이트 필요: $active")
+    else
+        details+=("메일 서비스 버전"); details+=("양호"); details+=("-")
+    fi
+    [[ "$output_mode" == "all" || ("$output_mode" == "vulnerable" && "$total_result" == "취약") ]] && result_print "U-45" "$desc" "$total_result" "${details[@]}"
+}
+
+# --------------------------------------------------------------------
+# [U_46] 일반 사용자의 메일 서비스 실행 방지
+# --------------------------------------------------------------------
+U_46() {
+    local output_mode=$1; local desc="사용자 메일 서비스 실행 방지"; local total_result="양호"; local details=()
+    if is_active sendmail && ! grep -Eiq '^O[[:space:]]+PrivacyOptions=.*(restrictqrun|goaway)' /etc/mail/sendmail.cf 2>/dev/null; then
+        total_result="취약"; details+=("sendmail 설정"); details+=("취약"); details+=("PrivacyOptions 설정 누락")
+    else
+        details+=("sendmail 설정"); details+=("양호"); details+=("-")
+    fi
+    [[ "$output_mode" == "all" || ("$output_mode" == "vulnerable" && "$total_result" == "취약") ]] && result_print "U-46" "$desc" "$total_result" "${details[@]}"
+}
+
+# --------------------------------------------------------------------
+# [U_47] 스팸 메일 릴레이 제한
+# --------------------------------------------------------------------
+U_47() {
+    local output_mode=$1; local desc="스팸 메일 릴레이 제한"; local total_result="양호"; local details=()
+    if command -v postconf >/dev/null 2>&1 && ! postconf -n 2>/dev/null | grep -Eq '^smtpd_relay_restrictions.*reject_unauth_destination'; then
+        total_result="취약"; details+=("릴레이 제한"); details+=("취약"); details+=("postfix 설정 확인 필요")
+    else
+        details+=("릴레이 제한"); details+=("양호"); details+=("-")
+    fi
+    [[ "$output_mode" == "all" || ("$output_mode" == "vulnerable" && "$total_result" == "취약") ]] && result_print "U-47" "$desc" "$total_result" "${details[@]}"
+}
+
+# --------------------------------------------------------------------
+# [U_48] expn, vrfy 명령어 제한
+# --------------------------------------------------------------------
+U_48() {
+    local output_mode=$1; local desc="expn, vrfy 명령어 제한"; local total_result="양호"; local details=()
+    if command -v postconf >/dev/null 2>&1 && ! postconf -n 2>/dev/null | grep -q '^disable_vrfy_command = yes'; then
+        total_result="취약"; details+=("SMTP 명령어 제한"); details+=("취약"); details+=("VRFY 제한 설정 필요")
+    else
+        details+=("SMTP 명령어 제한"); details+=("양호"); details+=("-")
+    fi
+    [[ "$output_mode" == "all" || ("$output_mode" == "vulnerable" && "$total_result" == "취약") ]] && result_print "U-48" "$desc" "$total_result" "${details[@]}"
+}
+
+# --------------------------------------------------------------------
+# [U_49] DNS 보안 버전 패치
+# --------------------------------------------------------------------
+U_49() {
+    local output_mode=$1; local desc="DNS 보안 버전 패치"; local total_result="양호"; local details=()
+    if apt list --upgradable 2>/dev/null | grep -Eiq '^(bind9|named)'; then
+        total_result="취약"; details+=("DNS 버전"); details+=("취약"); details+=("패키지 업데이트 필요")
+    else
+        details+=("DNS 버전"); details+=("양호"); details+=("-")
+    fi
+    [[ "$output_mode" == "all" || ("$output_mode" == "vulnerable" && "$total_result" == "취약") ]] && result_print "U-49" "$desc" "$total_result" "${details[@]}"
+}
+
+# --------------------------------------------------------------------
+# [U_50] DNS Zone Transfer 설정
+# --------------------------------------------------------------------
+U_50() {
+    local output_mode=$1; local desc="DNS Zone Transfer 설정"; local total_result="양호"; local details=()
+    local conf="/etc/bind/named.conf /etc/bind/named.conf.options"
+    if grep -RsiE 'allow-transfer[[:space:]]*\{[[:space:]]*(any|0\.0\.0\.0/0)' $conf 2>/dev/null | grep -q .; then
+        total_result="취약"; details+=("Zone Transfer"); details+=("취약"); details+=("any 허용 금지")
+    else
+        details+=("Zone Transfer"); details+=("양호"); details+=("-")
+    fi
+    [[ "$output_mode" == "all" || ("$output_mode" == "vulnerable" && "$total_result" == "취약") ]] && result_print "U-50" "$desc" "$total_result" "${details[@]}"
+}
+
+# --------------------------------------------------------------------
+# [U_51] DNS 서비스의 취약한 동적 업데이트 설정 금지
+# --------------------------------------------------------------------
+U_51() {
+    local output_mode=$1; local desc="DNS 동적 업데이트 금지"; local total_result="양호"; local details=()
+    local conf="/etc/bind/named.conf /etc/bind/named.conf.options"
+    if grep -RsiE 'allow-update[[:space:]]*\{[[:space:]]*(any|0\.0\.0\.0/0)' $conf 2>/dev/null | grep -q .; then
+        total_result="취약"; details+=("동적 업데이트"); details+=("취약"); details+=("any 업데이트 허용 금지")
+    else
+        details+=("동적 업데이트"); details+=("양호"); details+=("-")
+    fi
+    [[ "$output_mode" == "all" || ("$output_mode" == "vulnerable" && "$total_result" == "취약") ]] && result_print "U-51" "$desc" "$total_result" "${details[@]}"
+}
+
+# --------------------------------------------------------------------
+# [U_52] Telnet 서비스 비활성화
+# --------------------------------------------------------------------
+U_52() {
+    local output_mode=$1; local desc="Telnet 비활성화"; local total_result="양호"; local details=()
+    if is_enabled_or_active telnet || listen_tcp 23; then
+        total_result="취약"; details+=("Telnet 상태"); details+=("취약"); details+=("Telnet 사용 금지")
+    else
+        details+=("Telnet 상태"); details+=("양호"); details+=("-")
+    fi
+    [[ "$output_mode" == "all" || ("$output_mode" == "vulnerable" && "$total_result" == "취약") ]] && result_print "U-52" "$desc" "$total_result" "${details[@]}"
+}
+
+# --------------------------------------------------------------------
+# [U_53] FTP 서비스 정보 노출 제한
+# --------------------------------------------------------------------
+U_53() {
+    local output_mode=$1; local desc="FTP 정보 노출 제한"; local total_result="양호"; local details=()
+    details+=("FTP 배너 설정"); details+=("양호"); details+=("-")
+    [[ "$output_mode" == "all" || ("$output_mode" == "vulnerable" && "$total_result" == "취약") ]] && result_print "U-53" "$desc" "$total_result" "${details[@]}"
+}
+
+# --------------------------------------------------------------------
+# [U_54] 암호화되지 않는 FTP 서비스 비활성화
+# --------------------------------------------------------------------
+U_54() {
+    local output_mode=$1; local desc="평문 FTP 비활성화"; local total_result="양호"; local details=()
+    if is_active vsftpd || listen_tcp 21; then
+        total_result="취약"; details+=("FTP 상태"); details+=("취약"); details+=("암호화 FTP 사용 권장")
+    else
+        details+=("FTP 상태"); details+=("양호"); details+=("-")
+    fi
+    [[ "$output_mode" == "all" || ("$output_mode" == "vulnerable" && "$total_result" == "취약") ]] && result_print "U-54" "$desc" "$total_result" "${details[@]}"
+}
+
+# --------------------------------------------------------------------
+# [U_55] FTP 계정 Shell 제한
+# --------------------------------------------------------------------
+U_55() {
+    local output_mode=$1; local desc="FTP 계정 Shell 제한"; local total_result="양호"; local details=()
+    local shell="$(awk -F: '$1=="ftp"{print $7}' /etc/passwd 2>/dev/null)"
+    if [ -n "$shell" ] && ! echo "$shell" | grep -Eq '(/bin/false|/usr/sbin/nologin|/sbin/nologin)$'; then
+        total_result="취약"; details+=("FTP Shell"); details+=("취약"); details+=("로그인 가능 Shell 발견")
+    else
+        details+=("FTP Shell"); details+=("양호"); details+=("-")
+    fi
+    [[ "$output_mode" == "all" || ("$output_mode" == "vulnerable" && "$total_result" == "취약") ]] && result_print "U-55" "$desc" "$total_result" "${details[@]}"
+}
+
+# --------------------------------------------------------------------
+# [U_56] FTP 서비스 접근 제어 설정
+# --------------------------------------------------------------------
+U_56() {
+    local output_mode=$1; local desc="FTP 접근 제어"; local total_result="양호"; local details=()
+    details+=("FTP 접근 제어"); details+=("양호"); details+=("-")
+    [[ "$output_mode" == "all" || ("$output_mode" == "vulnerable" && "$total_result" == "취약") ]] && result_print "U-56" "$desc" "$total_result" "${details[@]}"
+}
+
+# --------------------------------------------------------------------
+# [U_57] Ftpusers 파일 설정
+# --------------------------------------------------------------------
+U_57() {
+    local output_mode=$1; local desc="FTP root 차단"; local total_result="양호"; local details=()
+    if grep -RsiE '^[[:space:]]*root[[:space:]]*$' /etc/ftpusers 2>/dev/null | grep -q .; then
+        details+=("root 차단"); details+=("양호"); details+=("-")
+    else
+        total_result="취약"; details+=("root 차단"); details+=("취약"); details+=("설정 확인 필요")
+    fi
+    [[ "$output_mode" == "all" || ("$output_mode" == "vulnerable" && "$total_result" == "취약") ]] && result_print "U-57" "$desc" "$total_result" "${details[@]}"
+}
+
+# --------------------------------------------------------------------
+# [U_58] 불필요한 SNMP 서비스 구동 점검
+# --------------------------------------------------------------------
+U_58() {
+    local output_mode=$1; local desc="SNMP 서비스 비활성화"; local total_result="양호"; local details=()
+    if is_active snmpd || listen_udp 161; then
+        total_result="취약"; details+=("SNMP 상태"); details+=("취약"); details+=("서비스 중지 필요")
+    else
+        details+=("SNMP 상태"); details+=("양호"); details+=("-")
+    fi
+    [[ "$output_mode" == "all" || ("$output_mode" == "vulnerable" && "$total_result" == "취약") ]] && result_print "U-58" "$desc" "$total_result" "${details[@]}"
+}
+
+# --------------------------------------------------------------------
+# [U_59] 안전한 SNMP 버전 사용
+# --------------------------------------------------------------------
+U_59() {
+    local output_mode=$1; local desc="SNMP v3 사용"; local total_result="양호"; local details=()
+    if grep -E '^[[:space:]]*(rocommunity|rwcommunity)' /etc/snmp/snmpd.conf 2>/dev/null | grep -q .; then
+        total_result="취약"; details+=("SNMP 버전"); details+=("취약"); details+=("v1/v2c 사용 중")
+    else
+        details+=("SNMP 버전"); details+=("양호"); details+=("-")
+    fi
+    [[ "$output_mode" == "all" || ("$output_mode" == "vulnerable" && "$total_result" == "취약") ]] && result_print "U-59" "$desc" "$total_result" "${details[@]}"
+}
+
+# --------------------------------------------------------------------
+# [U_60] SNMP Community String 복잡성 설정
+# --------------------------------------------------------------------
+U_60() {
+    local output_mode=$1; local desc="SNMP 문자열 복잡성"; local total_result="양호"; local details=()
+    details+=("SNMP 문자열"); details+=("양호"); details+=("-")
+    [[ "$output_mode" == "all" || ("$output_mode" == "vulnerable" && "$total_result" == "취약") ]] && result_print "U-60" "$desc" "$total_result" "${details[@]}"
+}
+
+# --------------------------------------------------------------------
+# [U_61] SNMP Access Control 설정
+# --------------------------------------------------------------------
+U_61() {
+    local output_mode=$1; local desc="SNMP 접근 통제"; local total_result="양호"; local details=()
+    details+=("SNMP 접근 통제"); details+=("양호"); details+=("-")
+    [[ "$output_mode" == "all" || ("$output_mode" == "vulnerable" && "$total_result" == "취약") ]] && result_print "U-61" "$desc" "$total_result" "${details[@]}"
+}
+
+# --------------------------------------------------------------------
+# [U_62] 로그인 시 경고 메시지 설정
+# --------------------------------------------------------------------
+U_62() {
+    local output_mode=$1; local desc="로그인 경고 메시지"; local total_result="양호"; local details=()
+    if grep -qi "WARNING" /etc/issue.net 2>/dev/null; then
+        details+=("경고 메시지"); details+=("양호"); details+=("-")
+    else
+        total_result="취약"; details+=("경고 메시지"); details+=("취약"); details+=("메시지 설정 필요")
+    fi
+    [[ "$output_mode" == "all" || ("$output_mode" == "vulnerable" && "$total_result" == "취약") ]] && result_print "U-62" "$desc" "$total_result" "${details[@]}"
+}
+
+
+# --------------------------------------------------------------------
+# [U_63] sudo 명령어 접근 관리
+# --------------------------------------------------------------------
+U_63() {
+    local output_mode=$1; local desc="sudo 접근 관리"; local total_result="양호"; local details=()
+    if [ -f /etc/sudoers ] && [ "$(stat -c %a /etc/sudoers)" -le 440 ]; then
+        details+=("sudo 권한"); details+=("양호"); details+=("-")
+    else
+        total_result="취약"; details+=("sudo 권한"); details+=("취약"); details+=("권한 설정 확인")
+    fi
+    [[ "$output_mode" == "all" || ("$output_mode" == "vulnerable" && "$total_result" == "취약") ]] && result_print "U-63" "$desc" "$total_result" "${details[@]}"
+}
+
+# --------------------------------------------------------------------
+# [U_64] 주기적 보안 패치 및 벤더 권고사항 적용
+# --------------------------------------------------------------------
+U_64()
+{
+    local output_mode=$1
+    local desc="주기적 보안 패치 및 벤더 권고사항 적용"
+    
+    # 정책 수립 여부는 스크립트가 알 수 없으므로 실무 원칙에 따라 '수동점검'으로 분류
+    local total_result="양호"
+    local details=()
+
+    # /etc/os-release 파일과 uname 명령어로 현재 OS 및 커널 정보 추출
+    local os_info=$(grep "^PRETTY_NAME=" /etc/os-release | cut -d= -f2 | tr -d '"')
+    local kernel_info=$(uname -r)
+
+    details+=("현재 시스템 OS 및 커널 버전 확인")
+    details+=("수동점검")
+    details+=("OS: $os_info / Kernel: $kernel_info (최신 패치 적용 및 정책 문서 실사 필요)")
+
+    # 출력 
+    if [[ "$output_mode" == "all" ]]; then
+        result_print "U-64" "$desc" "$total_result" "${details[@]}"
+    elif [[ "$output_mode" == "vulnerable" && "$total_result" == "취약" ]]; then
+        result_print "U-64" "$desc" "$total_result" "${details[@]}"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_65] NTP 및 시각 동기화 설정
+# --------------------------------------------------------------------
+U_65() {
+    local output_mode=$1; local desc="NTP 및 시각 동기화 설정"
+    local total_result="취약"; local details=()
+
+    # 1. 서비스 활성화 여부 확인
+    local is_active=false
+    if systemctl is-active --quiet systemd-timesyncd || \
+       systemctl is-active --quiet chronyd || \
+       systemctl is-active --quiet ntpd; then
+        is_active=true
+    fi
+
+    # 2. 결과 판정
+    if [ "$is_active" = true ]; then
+        total_result="양호"
+        details+=("NTP 서비스 활성화")
+        details+=("양호")
+        details+=("시간 동기화 서비스가 정상 실행 중입니다.")
+    else
+        details+=("NTP 서비스 비활성화")
+        details+=("취약")
+        details+=("systemd-timesyncd, chrony, ntp 중 하나를 설치 및 활성화하세요.")
+    fi
+
+    [[ "$output_mode" == "all" || ("$output_mode" == "vulnerable" && "$total_result" == "취약") ]] && result_print "U-65" "$desc" "$total_result" "${details[@]}"
+}
+
+
+# --------------------------------------------------------------------
+# [U_66] 정책에 따른 시스템 로깅 설정
+# --------------------------------------------------------------------
+U_66()
+{
+    local output_mode=$1
+    local desc="정책에 따른 시스템 로깅 설정"
+    local total_result="양호"
+    local details=()
+
+    # 1. rsyslog(로그 기록기) 서비스가 살아서 돌고 있는지 확인
+    local rsyslog_status=$(systemctl is-active rsyslog 2>/dev/null)
+
+    if [[ "$rsyslog_status" != "active" ]]; then
+        total_result="취약"
+        details+=("rsyslog 서비스 활성화 여부")
+        details+=("취약")
+        details+=("rsyslog 서비스가 중지됨. 'systemctl start rsyslog' 명령으로 실행 필요")
+    else
+        details+=("rsyslog 서비스 활성화 여부")
+        details+=("양호")
+        details+=("-")
+    fi
+
+    # 2. 우분투 환경의 기본 로그 설정 파일들 경로
+    local log_files="/etc/rsyslog.conf /etc/rsyslog.d/*.conf"
+    
+    # 3. 핵심 3대장(인증, 크론, 메일) 로그 기록이 주석(#) 처리 없이 켜져 있는지 검색
+    local check_auth=$(grep -E "^\s*authpriv\.|^\s*auth\," $log_files 2>/dev/null)
+    local check_cron=$(grep -E "^\s*cron\." $log_files 2>/dev/null)
+    local check_mail=$(grep -E "^\s*mail\." $log_files 2>/dev/null)
+
+    # 셋 중 하나라도 꺼져있다면 취약!
+    if [[ -z "$check_auth" || -z "$check_cron" || -z "$check_mail" ]]; then
+        total_result="취약"
+        details+=("주요 로그(auth, cron, mail) 기록 설정 여부")
+        details+=("취약")
+        details+=("/etc/rsyslog.d/50-default.conf 등에서 authpriv, cron, mail 로그 기록 주석 해제 필요")
+    else
+        details+=("주요 로그(auth, cron, mail) 기록 설정 여부")
+        details+=("양호")
+        details+=("-")
+    fi
+
+    # 출력
+    if [[ "$output_mode" == "all" ]]; then
+        result_print "U-66" "$desc" "$total_result" "${details[@]}"
+    elif [[ "$output_mode" == "vulnerable" && "$total_result" == "취약" ]]; then
+        result_print "U-66" "$desc" "$total_result" "${details[@]}"
+    fi
+}
+
+# --------------------------------------------------------------------
+# [U_67] 로그 디렉터리 소유자 및 권한 설정
+# --------------------------------------------------------------------
+U_67()
+{
+    local output_mode=$1
+    local desc="로그 디렉터리 소유자 및 권한 설정"
+    local total_result="양호"
+    local details=()
+
+    # 우분투 및 리눅스 주요 로그 파일 리스트
+    local log_files=("/var/log/syslog" "/var/log/auth.log" "/var/log/daemon.log" "/var/log/mail.log" "/var/log/messages" "/var/log/secure")
+    local vulnerable_logs=()
+
+    # 파일이 존재하는지 확인 후 소유자와 권한 체크
+    for log in "${log_files[@]}"; do
+        if [ -f "$log" ]; then
+            # %U는 소유자 이름, %a는 644 같은 숫자 권한을 뽑아옵니다.
+            local owner=$(stat -c "%U" "$log")
+            local perm=$(stat -c "%a" "$log" | grep -o '...$') 
+            
+            # 소유자가 root 또는 syslog가 아니거나, 권한이 644보다 큰 경우 (취약)
+            if [[ "$owner" != "root" && "$owner" != "syslog" ]] || [ "$perm" -gt 644 ]; then
+                vulnerable_logs+=("$log(소유자:$owner/권한:$perm)")
+            fi
+        fi
+    done
+
+    # 취약한 파일이 하나도 없다면 양호!
+    if [ ${#vulnerable_logs[@]} -eq 0 ]; then
+        details+=("주요 로그 파일 소유자(root) 및 권한(644 이하) 설정")
+        details+=("양호")
+        details+=("-")
+    else
+        # 하나라도 걸리면 취약!
+        total_result="취약"
+        details+=("주요 로그 파일 소유자(root) 및 권한(644 이하) 설정")
+        details+=("취약")
+        
+        local formatted_logs=$(IFS=, ; echo "${vulnerable_logs[*]}")
+        details+=("취약 파일 발견: [ $formatted_logs ]. chown root 및 chmod 644 명령으로 조치 필요")
+    fi
+
+    # 출력 
+    if [[ "$output_mode" == "all" ]]; then
+        result_print "U-67" "$desc" "$total_result" "${details[@]}"
+    elif [[ "$output_mode" == "vulnerable" && "$total_result" == "취약" ]]; then
+        result_print "U-67" "$desc" "$total_result" "${details[@]}"
+    fi
+}
+
+# --------------------------------------------------------------------
+# 메인 실행부 (스크립트 제일 마지막에 위치)
+# --------------------------------------------------------------------
+main() {
+    # 1. 인자값(all 또는 vulnerable)을 받음. 없으면 기본값은 'all'
+    local mode=${1:-"all"}
+
+    # 1. 1번부터 67번까지 순차 실행
+    for i in {1..67}; do
+        local func_name=$(printf "U_%02d" $i)
+        if declare -f "$func_name" > /dev/null; then
+            # 'all' 대신 변수 $mode를 사용
+            "$func_name" "$mode"
+        fi
+    done
+
+    # 2. 요약 정보 출력 (사진의 디자인 반영)
+echo -e "\e[34m==========================================================\e[0m"
+echo -e "\e[34m==========================================================\e[0m"
+echo -ne "\e[1;36m점검 요약\e[0m\t전체 : \e[1m${TOTAL_COUNT}\e[0m\t"
+echo -ne "양호 : \e[42;30m 양호 \e[0m \e[1m${GOOD_COUNT}\e[0m\t"
+echo -ne "취약 : \e[41;37m 취약 \e[0m \e[1m${BAD_COUNT}\e[0m\t"
+echo -e "수동 확인 : \e[43;30m 수동 확인 \e[0m \e[1m${MANUAL_COUNT}\e[0m"
+echo -e "\e[34m==========================================================\e[0m"
+echo -e "\e[34m==========================================================\e[0m\n"
+}
+
+main "$1" 
