@@ -1,17 +1,39 @@
 # Operation Follow Me (FM 8+)
 
-[이스트캠프] 가디언즈 정보보호 및 인프라 관리 10기 3차 팀 프로젝트 
-**팔로팔로미**
+[이스트캠프] 가디언즈 정보보호 및 인프라 관리 10기 3차 팀 프로젝트
+**모의해킹 기반 FM 8+ 정보보호 진단 · 팔로팔로미(= "Follow Follow me")**
 
-Operation Follow Me (모의해킹 기반 FM 8+ 정보보호 진단)
+## 프로젝트 개요
 
 | 항목 | 내용 |
 |---|---|
-| 진행기간 | 2026.07.23 ~ 2026.08.04 |
-| 팀 구성 | 팔로팔로미 — 김혜미(팀장) 외 4명 |
-| 핵심기술 | Firewall(pfSense), IDS·IPS(Suricata), WAF(ModSecurity), SIEM(ELK Stack) |
+| 프로젝트명 | Operation Follow Me (FM 8+) |
+| 진행 기간 | 2026.07.23 ~ 2026.08.04 |
+| 팀 구성 | 팔로팔로미 \| 김혜미(팀장) 외 4명 |
+| 핵심 기술 | Firewall(pfSense), IDS·IPS(Suricata), WAF(ModSecurity), SIEM(ELK Stack) |
 
-가상의 통신사 인프라(FM 8+)를 직접 구축한 뒤, Red Team(모의해킹)과 Blue Team(보안관제)이 같은 환경을 서로 다른 관점에서 진단한 결과를 정리한 저장소입니다. 2025년 4월 SK텔레콤 HSS 침해사고(USIM 인증키 평문 저장, 탐지까지 약 22시간 지연, 다수 서버 확산, 축소 보고)를 근본 원인 관점에서 재구성해, 취약점 진단 → 실시간 탐지·차단 → 로그 통합분석(SIEM)까지 이어지는 침해사고 대응 체계를 실증하는 것이 목표입니다.
+**선정 배경**
+2025년 4월 SK텔레콤 HSS 침해사고(USIM 인증키 평문 저장, 탐지까지 약 22시간 지연, 다수 서버 확산, 축소 보고)를 근본 원인 관점에서 재구성함.
+
+**프로젝트 목표**
+가상의 통신사 인프라(FM 8+)를 직접 구축한 뒤, Red Team(모의해킹)과 Blue Team(보안관제)이 같은 환경을 서로 다른 관점에서 진단해, 취약점 진단 → 실시간 탐지·차단 → 로그 통합분석(SIEM)까지 이어지는 침해사고 대응 체계를 실증함.
+
+## 팀 구성 (WBS)
+
+| 이름 | 역할 | 담당 업무 |
+|---|---|---|
+| 김혜미 | 팀장 / 모의해킹·악성코드 분석 | OWASP Top 10 취약점 선정, 악성코드 동적 분석, 보고서 작성 |
+
+## 기술 스택
+
+| 구분 | 기술 |
+|---|---|
+| OS | Ubuntu Server 24.04 |
+| 가상화 | GNS3 |
+| 공격 도구 | Kali Linux |
+| DB | MariaDB |
+| 보안 장비 | pfSense (Firewall) · Suricata (IDS/IPS) · ModSecurity (WAF) |
+| SIEM | ELK Stack (Elasticsearch, Logstash, Kibana) |
 
 ## 저장소 구성
 
@@ -25,7 +47,7 @@ Operation Follow Me (모의해킹 기반 FM 8+ 정보보호 진단)
 | [`6_팔로팔로미_시스템점검쉘스크립트.txt`](<./6_팔로팔로미_시스템점검쉘스크립트.txt>) | 시스템 점검 자동화 스크립트 원본(Bash) — U-01~U-67 항목 자동 점검 |
 | [`7_팔로팔로미_기업정보보호점검결과보고서.pdf`](<./7_팔로팔로미_기업정보보호점검결과보고서.pdf>) | 기업 정보보호 점검 결과보고서 — Red Team 진단 + Blue Team 관제 검증 통합, 탐지 커버리지 분석 |
 
-## 진단 결과 요약
+## 수행 결과 요약
 
 ### 모의해킹(Red Team) — FM 8+ 웹 애플리케이션
 
@@ -62,7 +84,7 @@ KISA 서버 취약점 점검 가이드 기반 자동화 스크립트(U-01~U-67)�
 
 VirusTotal, Detect It Easy, file/strings/nm/readelf/objdump, Ghidra를 이용한 정적 분석과 Wireshark·strace 기반 동적 분석을 병행해 매직 패킷 트리거(`is_magic_packet`) 및 리버스쉘 실행(`spawn_reverse_shell`) 로직, C2 통신 방식, 탐지 회피 특징을 분석하고 IoC와 대응 권고를 도출했습니다.
 
-## 시스템 점검 스크립트 사용법
+## 스크립트 사용법
 
 `6_팔로팔로미_시스템점검쉘스크립트.txt`는 KISA 가이드 U-01~U-67 항목을 자동 점검하는 Bash 스크립트입니다(Ubuntu 대상).
 
@@ -71,20 +93,3 @@ chmod +x check.sh
 ./check.sh all          # 전체 67개 항목 점검 결과 출력
 ./check.sh vulnerable   # 취약 판정된 항목만 출력
 ```
-
-## 기술 스택
-
-| 구분 | 기술 |
-|---|---|
-| OS | Ubuntu Server 24.04 |
-| 가상화 | GNS3 |
-| 공격 도구 | Kali Linux |
-| DB | MariaDB |
-| 보안 장비 | pfSense (Firewall) · Suricata (IDS/IPS) · ModSecurity (WAF) |
-| SIEM | ELK Stack (Elasticsearch, Logstash, Kibana) |
-
-## 팀 구성 (WBS)
-
-| 이름 | 역할 | 주요 업무 |
-|---|---|---|
-| 김혜미 | 팀장 / 모의해킹·악성코드 분석 | OWASP Top 10 취약점 선정, 악성코드 동적 분석, 보고서 작성 |
